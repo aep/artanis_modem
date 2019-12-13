@@ -1,0 +1,733 @@
+using <stdio.h>::{perror, printf};
+using <stdlib.h>::{exit};
+using <string.h>::{strlen, memset};
+using string;
+using io;
+using io::unix;
+using time;
+using err;
+using net::udp as netudp;
+using <unistd.h>::{usleep};
+using net::address;
+using <stdlib.h>::{atoi};
+
+pub enum Event {
+    Enter,
+    Ok,
+    Data,
+    Timeout,
+}
+
+struct Socket {
+    usize   id;
+    bool    used;
+    bool    isopen;
+    bool    isready;
+}
+
+union StateMem {
+    usize socket;
+}
+
+struct Modem {
+    State               state;
+    StateMem            statem;
+    io::Io              mut io;
+    io::Io              mut timeout;
+    usize               retries;
+    u8                  network;
+    Socket              sockets[15];
+
+    //TODO disable echo, so we never receive that much
+    string::String+1460 mut inbuf;
+    string::String+1460 mut outbuf;
+}
+
+
+pub fn new(Modem mut* self) {
+    memset(self, 0, sizeof(Modem));
+}
+
+// high level socket api
+
+export fn udp(Modem mut*self, err::Err+et mut*e, io::Async mut* async) -> netudp::Socket
+    where err::checked(*e)
+{
+    netudp::Socket mut sock = {0};
+    (sock.ctx).async    = async;
+    (sock.ctx).handle   = self;
+    sock.impl_sendto    = (void*)sendto;
+    sock.impl_recvfrom  = (void*)recvfrom;
+
+    if self->state != State::Ready {
+        err::fail(e, 2, "modem not ready");
+        return sock;
+    }
+
+    for (usize mut i = 0; i < static(len(self->sockets)); i++) {
+        if ((self->sockets)[i]).used == false {
+            ((self->sockets)[i]).used = true;
+            self->state = State::Open;
+            self->next(e, async, Event::Enter);
+            (self->statem).socket = i;
+            (sock.ctx).fd = (int)i;
+            return sock;
+        }
+    }
+
+    err::fail(e, 2, "too many open sockets");
+    return sock;
+}
+
+fn recvfrom(
+        netudp::Socket mut*self,
+        err::Err+et mut *e,
+        u8 mut* mem,
+        usize mut*memlen,
+        address::Address *addr
+) -> io::Result
+    where err::checked(*e)
+    where *memlen >= len(mem)
+{
+    Modem mut * modem = as<Modem mut *>((self->ctx).handle);
+    static_attest(safe(modem));
+    return recvfrom_(modem, e, self, mem, memlen, addr);
+}
+
+
+fn recvfrom_(
+        Modem mut* self,
+        err::Err+et mut *e,
+        netudp::Socket mut* sock,
+        u8 mut* mut mem,
+        usize mut*memlen,
+        address::Address *addr
+) -> io::Result
+    where err::checked(*e)
+    where *memlen >= len(mem)
+{
+    if self->state != State::Ready {
+        return io::Result::Later;
+    }
+
+    usize idx = as<usize>((sock->ctx).fd);
+    static_attest(idx < len(self->sockets));
+
+    if !((self->sockets)[idx]).isready {
+        return io::Result::Later;
+    }
+
+    string::String+50  mut str = {0};
+    str.format("AT+QIRD=%u,%u", idx + 1, *memlen);
+    static_attest(nullterm(str.mem));
+    self->cmd_cstr(e, str.mem);
+    if err::check(e) { return io::Result::Error; }
+
+    // unfortunately we have to spin here
+
+    (self->inbuf).clear();
+    for (usize mut i = 0;i<300 ;i++) {
+        if (self->io).readline(e, &self->inbuf) == io::Result::Ready {
+            if err::check(e) { return io::Result::Error; }
+            if string::starts_with_cstr(&self->inbuf, "+QIRD: ") {
+                static_attest(len((self->inbuf).mem) > 7);
+                printf("QIRD >%s<\n", (self->inbuf).mem + 7);
+                usize mut incomming_bytes = (usize)atoi((self->inbuf).mem + 7);
+
+
+                // read the addtional \r or \n at the end not consumed by readline
+                u8 mut nop[2];
+                usize mut nopl = 1;
+                (self->io).read_bytes(e, nop, &nopl);
+                if err::check(e) { return io::Result::Error; }
+
+                if incomming_bytes == 0 {
+                    ((self->sockets)[idx]).isready = false;
+                    return io::Result::Later;
+                }
+
+                if *memlen < incomming_bytes {
+                    incomming_bytes = *memlen
+                }
+
+                for (usize mut i = 0;i<1000;i++) {
+                    usize mut l = incomming_bytes;
+                    (self->io).read_bytes(e, mem, &l);
+                    if err::check(e) { return io::Result::Error; }
+                    if l >= incomming_bytes {
+                        return io::Result::Ready;
+                    }
+                    incomming_bytes -= l;
+                    mem += l;
+                }
+                break;
+            }
+            (self->inbuf).clear();
+        }
+        if err::check(e) { return io::Result::Error; }
+        usleep(1000);
+    }
+
+    if err::check(e) { return io::Result::Error; }
+    printf("no response from QIRD\n");
+    self->state = State::Reboot;
+    static_attest(safe((sock->ctx).async));
+    return next(self, e, (sock->ctx).async, Event::Enter);
+}
+
+
+
+fn sendto(
+        netudp::Socket mut*self,
+        err::Err+et mut *e,
+        u8* mem,
+        usize mut*memlen,
+        address::Address *addr
+) -> io::Result
+    where err::checked(*e)
+    where *memlen <= len(mem)
+{
+    Modem mut * modem = as<Modem mut *>((self->ctx).handle);
+    static_attest(safe(modem));
+    return sendto_(modem, e, self, mem, memlen, addr);
+}
+
+fn sendto_(
+        Modem mut* self,
+        err::Err+et mut *e,
+        netudp::Socket mut* sock,
+        u8* mem,
+        usize mut*memlen,
+        address::Address *addr
+) -> io::Result
+    where err::checked(*e)
+    where *memlen <= len(mem)
+{
+    if self->state != State::Ready {
+        return io::Result::Later;
+    }
+
+    usize idx = as<usize>((sock->ctx).fd);
+    static_attest(idx < len(self->sockets));
+
+    if !((self->sockets)[idx]).isopen {
+        return io::Result::Later;
+    }
+
+    (self->outbuf).clear();
+    (self->outbuf).append_bytes(mem, *memlen);
+
+
+    printf("sending %zu bytes\n", (self->outbuf).len);
+
+    string::String+100 mut str = {0};
+    str.format("AT+QISEND=%u,%u,\"", idx + 1, (self->outbuf).len);
+    addr->ip_to_string(&str);
+    str.format("\",%u", addr->get_port());
+
+
+    static_attest(nullterm(str.mem));
+    self->cmd_cstr(e, str.mem);
+    if err::check(e) { return io::Result::Error; }
+
+    self->state = State::Send;
+
+
+    //(self->io).write_bytes(e, (u8*)msg, &msglen);
+    //if err::check(e) { return io::Result::Error; }
+
+    return io::Result::Ready;
+}
+
+
+
+// low level interface
+
+pub fn poll(Modem mut* self, err::Err+et mut *e, io::Async mut* async) -> io::Result
+    where err::checked(*e)
+{
+    io::Result mut rr =  io::Result::Later;
+
+
+    if (self->timeout).read_impl != 0 {
+        string::String+8 mut buf = {0};
+        if (self->timeout).read(e, &buf) == io::Result::Ready {
+
+            (self->timeout).close();
+
+            if err::check(e) { return io::Result::Error; }
+
+            next(self, e, async, Event::Timeout);
+            if err::check(e) { return io::Result::Error; }
+
+            async->select(e, &self->io, io::Ready::Read);
+            if err::check(e) { return io::Result::Error; }
+        }
+    }
+
+
+    switch (self->io).readline(e, &self->inbuf) {
+        io::Result::Ready => {
+            if err::check(e) { return io::Result::Error; }
+            if (self->inbuf).len > 0 {
+                printf("        >%.*s<\n", as<int>((self->inbuf).len), (self->inbuf).mem);
+                if string::eq_cstr(&self->inbuf, "OK") {
+
+                    rr = next(self, e, async, Event::Ok);
+                    if err::check(e) { return io::Result::Error; }
+
+                } else if string::starts_with_cstr(&self->inbuf, "+QIURC: \"recv\",") {
+                    static_attest((self->inbuf).len < len((self->inbuf).mem));
+                    static_attest(len((self->inbuf).mem) > 15 );
+                    printf("UIRC: %s\n", (self->inbuf).mem + 15);
+
+                    int fd = (int)atoi((self->inbuf).mem + 15) - 1;
+                    if fd >= 0 && fd < static(len(self->sockets)) {
+                        usize fdi = as<usize>(fd);
+                        ((self->sockets)[fdi]).isready = true;
+                        printf("socket activated: %zu\n", fdi);
+                    }
+                }  else {
+                    rr = next(self, e, async, Event::Data);
+                    if err::check(e) { return io::Result::Error; }
+                }
+            }
+
+            (self->inbuf).clear();
+        }
+        io::Result::Error => {
+            err::check(e);
+            return io::Result::Error;
+        }
+        io::Result::Later => {
+            if self->state == State::Send && (self->inbuf).eq_cstr(">") {
+                rr = next(self, e, async, Event::Data);
+                (self->inbuf).clear();
+            }
+        }
+        io::Result::Eof => {
+            return io::Result::Eof;
+        }
+    }
+    if err::check(e) {
+        return io::Result::Error;
+    }
+
+
+    if err::check(e) {
+        return io::Result::Error;
+    }
+
+    return rr;
+}
+
+enum State {
+    InitModem,
+    InitUsim,
+    WaitForReg,
+    InitApn,
+    InitPdp,
+    GetIpAddress,
+    Ready,
+    Open,
+    Send,
+    Reboot,
+    RebootWait,
+}
+
+
+pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev) -> io::Result
+    where err::checked(*e)
+{
+    static_attest(len((self->inbuf).mem) > 7 );
+
+    switch self->state {
+        State::InitModem => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_seconds(1));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    printf("waiting for modem\n");
+                    cmd_cstr(self, e, "AT");
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                    (self->timeout).close();
+
+                    self->state = State::InitUsim;
+                    return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {}
+                Event::Timeout => {
+                    (self->timeout).close();
+
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::InitUsim => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_millis(100));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    if err::check(e) {
+                        return io::Result::Error;
+                    }
+                    printf("waiting for sim\n");
+                    cmd_cstr(self, e, "AT+CPIN?");
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                    (self->timeout).close();
+
+                    self->state = State::WaitForReg;
+                    return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {
+                    if string::starts_with_cstr(&self->inbuf, "+CPIN: ") {
+                        static_attest((self->inbuf).len < len((self->inbuf).mem));
+                        static_attest(len((self->inbuf).mem) > 7 );
+
+                        printf("SIM: >%.*s<\n", as<int>((self->inbuf).len - 7), (self->inbuf).mem + 7);
+                    }
+                }
+                Event::Timeout => {
+                    (self->timeout).close();
+                    printf("sim timeout\n");
+                    self->state = State::Reboot;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::WaitForReg => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_millis(100));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    self->retries = 0;
+                    printf("waiting for network\n");
+                    cmd_cstr(self, e, "AT+CREG?");
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+
+                    if self->network == 5 || self->network == 1 {
+                        self->state = State::InitApn;
+                        return next(self, e, async, Event::Enter);
+                    }
+                }
+                Event::Data => {
+                    if string::starts_with_cstr(&self->inbuf, "+CREG: ") && (self->inbuf).len > 9  {
+                        static_attest(9 < len((self->inbuf).mem));
+                        self->network = as<u8>(((self->inbuf).mem)[9] - '0');
+                    }
+                }
+                Event::Timeout => {
+                    (self->timeout).close();
+
+                    self->retries += 1;
+                    printf("waiting for network %zu\n", self->retries);
+                    cmd_cstr(self, e, "AT+CREG?");
+                    if err::check(e) { return io::Result::Error; }
+
+                    if self->retries > 10 {
+                        printf("reg retry timeout\n");
+                        self->state = State::Reboot;
+                        return next(self, e, async, Event::Enter);
+                    } else {
+                        self->timeout = io::timeout(async, e, time::from_seconds(1));
+                        if err::check(e) { return io::Result::Error; }
+                        async->select(e, &self->timeout, io::Ready::Read);
+                        if err::check(e) { return io::Result::Error; }
+                    }
+                }
+            }
+        }
+        State::InitApn => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_millis(100));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    printf("setting apn\n");
+                    cmd_cstr(self, e, r#"AT+QICSGP=1,1,"iot.1nce.net","","",0"#);
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                    (self->timeout).close();
+
+                    self->state = State::InitPdp;
+                    return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {}
+                Event::Timeout => {
+                    (self->timeout).close();
+
+                    printf("init apn timeout\n");
+                    self->state = State::Reboot;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::InitPdp => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_seconds(10));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    printf("waiting for pdp\n");
+                    cmd_cstr(self, e, "AT+QIACT=1");
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                    (self->timeout).close();
+
+                    self->state = State::GetIpAddress;
+                    return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {
+                    if string::starts_with_cstr(&self->inbuf, "ERROR") {
+                        (self->timeout).close();
+                        printf("pdp error\n");
+                        self->state = State::Reboot;
+                        return next(self, e, async, Event::Enter);
+                    }
+                }
+                Event::Timeout => {
+                    (self->timeout).close();
+                    printf("pdp timeout\n");
+                    self->state = State::Reboot;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::GetIpAddress => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_millis(100));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    printf("get ip address\n");
+                    cmd_cstr(self, e, "AT+QIACT?");
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                    (self->timeout).close();
+
+                    self->state = State::Ready;
+                    return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {}
+                Event::Timeout => {
+                    (self->timeout).close();
+
+                    printf("get ip timeout\n");
+                    self->state = State::Reboot;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::Ready => {
+            switch ev {
+                Event::Enter => {
+                    printf("ready \n");
+                    self->timeout = io::timeout(async, e, time::from_seconds(2));
+                    if err::check(e) { return io::Result::Error; }
+
+                    // see if we need to open any sockets
+                    for (usize mut i = 0; i < static(len(self->sockets)); i++) {
+                        if ((self->sockets)[i]).used && !((self->sockets)[i]).isopen {
+                            (self->statem).socket = i;
+                        }
+                    }
+                    return io::Result::Ready;
+                }
+                Event::Ok       => {}
+                Event::Data     => {}
+                Event::Timeout  => {
+                    printf("keepalive\n");
+                    cmd_cstr(self, e, "AT");
+                    if err::check(e) { return io::Result::Error; }
+                    self->timeout = io::timeout(async, e, time::from_seconds(2));
+                    if err::check(e) { return io::Result::Error; }
+                }
+            }
+        }
+        State::Open => {
+            switch ev {
+                Event::Enter => {
+                    printf("opening socket %zu\n", (self->statem).socket);
+
+                    self->timeout = io::timeout(async, e, time::from_millis(200));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    self->timeout = io::timeout(async, e, time::from_seconds(1));
+                    if err::check(e) { return io::Result::Error; }
+
+                    self->timeout = io::timeout(async, e, time::from_millis(100));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    printf("open socket\n");
+
+                    //TODO random port
+                    string::String+100 mut str = {0};
+                    str.format("AT+QIOPEN=1,%u,\"UDP SERVICE\",\"127.0.0.1\",0,200%u,0",
+                        (self->statem).socket + 1, (self->statem).socket + 1);
+
+                    static_attest(nullterm(str.mem));
+                    cmd_cstr(self, e, str.mem);
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                }
+                Event::Data => {
+                    if string::starts_with_cstr(&self->inbuf, "+QIOPEN: ") && (self->inbuf).len > 11  {
+
+                        (self->timeout).close();
+
+                        static_attest((self->statem).socket < len(self->sockets));
+                        ((self->sockets)[(self->statem).socket]).isopen = true;
+                        (self->statem).socket = 0;
+
+                        self->state = State::Ready;
+                        return next(self, e, async, Event::Enter);
+                    }
+                }
+                Event::Timeout => {
+                    (self->timeout).close();
+
+                    printf("open timeout\n");
+                    self->state = State::Reboot;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::Send => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_millis(200));
+                }
+                Event::Ok => {}
+                Event::Data => {
+                    if string::starts_with_cstr(&self->inbuf, ">") {
+                        (self->timeout).close();
+                        usize mut l = (self->outbuf).len;
+                        (self->io).write_bytes(e, as<u8*>((self->outbuf).mem), &l);
+                        if err::check(e) {
+                            return io::Result::Error;
+                        }
+
+                        self->state = State::Ready;
+                        return next(self, e, async, Event::Enter);
+                    }
+                }
+                Event::Timeout => {
+                    (self->timeout).close();
+
+                    printf("send timeout\n");
+                    self->state = State::Reboot;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::Reboot => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_seconds(2));
+                    if err::check(e) {
+                        return io::Result::Error;
+                    }
+                    printf("reboot\n");
+                    cmd_cstr(self, e, "AT+CFUN=1,1");
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                    self->state = State::RebootWait;
+                    return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {}
+                Event::Timeout => {
+                    self->state = State::RebootWait;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::RebootWait => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_seconds(3));
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {}
+                Event::Data => {}
+                Event::Timeout => {
+                    self->state = State::InitModem;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        default => {
+            switch ev {
+                Event::Enter => {}
+                Event::Data => {
+                    printf("unhandled modem response: >%.*s<\n", as<int>((self->inbuf).len), (self->inbuf).mem);
+                }
+                Event::Ok => {
+                    printf("bug: ok without command. OUT OF SYNC!\n");
+                }
+                Event::Timeout => {}
+            }
+
+        }
+    }
+
+    return io::Result::Later;
+}
+
+
+
+pub fn cmd_cstr(Modem mut* self, err::Err+et mut*e, char *cstr)
+    where nullterm(cstr)
+    where err::checked(*e)
+{
+    usize mut cstrlen = string::strlen(cstr);
+    (self->io).write_bytes(e, (u8*)cstr, &cstrlen);
+    if err::check(e) {
+        return;
+    }
+
+    cstrlen = 1;
+    (self->io).write_bytes(e, (u8*)"\r", &cstrlen);
+    if err::check(e) {
+        return;
+    }
+}
+
+
+
+
+pub fn start(Modem mut* self, err::Err+et mut *e, io::Async mut* async)
+    where err::checked(*e)
+{
+    next(self, e, async, Event::Enter);
+}
+

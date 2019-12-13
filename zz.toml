@@ -1,0 +1,17 @@
+[project]
+version = "0.1.0"
+name = "modem"
+cincludes = []
+cobjects = []
+pkgconfig = []
+cflags = []
+lflags = []
+
+[variants]
+default = []
+
+[dependencies]
+string = "1"
+io = "1"
+net = "1"
+carrier = "1"
