@@ -1,11 +1,13 @@
 using <stdio.h>::{perror, printf};
 using <stdlib.h>::{exit};
-using <string.h>::{strlen, memset};
+using <string.h>::{strlen, memset, memcpy};
+using <assert.h>::{assert};
 using string;
 using io;
 using io::unix;
 using time;
 using err;
+using net;
 using net::udp as netudp;
 using <unistd.h>::{usleep};
 using net::address;
@@ -21,62 +23,92 @@ pub enum Event {
 struct Socket {
     usize   id;
     bool    used;
+    bool    close;
     bool    isopen;
     bool    isready;
+    string::String+1460 mut inbuf;
 }
 
-union StateMem {
-    usize socket;
+struct StateMem {
 }
 
-struct Modem {
+struct Modem+ {
+    net::Engine         netengine;
     State               state;
-    StateMem            statem;
+
+    usize               current_state_socket;
+    int                 current_state_expectsize;
+
     io::Io              mut io;
     io::Io              mut timeout;
     usize               retries;
     u8                  network;
-    Socket              sockets[15];
 
     //TODO disable echo, so we never receive that much
-    string::String+1460 mut inbuf;
     string::String+1460 mut outbuf;
+    string::String+1460 mut inbuf;
+
+    usize   mut maxfd;
+    Socket  sockets[];
 }
 
 
-pub fn new(Modem mut* self) {
+pub fn new(Modem+maxfd mut* self)
+    where maxfd < 16
+{
     memset(self, 0, sizeof(Modem));
+    self->netengine.impl_new_udp = (void*)udp_new;
+    self->netengine.handle1 = self;
+    self->maxfd = maxfd;
 }
 
 // high level socket api
 
-export fn udp(Modem mut*self, err::Err+et mut*e, io::Async mut* async) -> netudp::Socket
+
+fn udp_new(net::Engine *engine, err::Err+et mut*e, address::Address *local_addr, io::Async mut* unsafe async) -> netudp::Socket
     where err::checked(*e)
 {
+    Modem mut* self = (Modem mut*)engine->handle1;
+    static_attest(safe(self));
+
+    assert(async != 0);
+    static_attest(safe(async));
+
     netudp::Socket mut sock = {0};
     (sock.ctx).async    = async;
     (sock.ctx).handle   = self;
     sock.impl_sendto    = (void*)sendto;
     sock.impl_recvfrom  = (void*)recvfrom;
+    sock.impl_close     = sockclose;
 
-    if self->state != State::Ready {
-        err::fail(e, 2, "modem not ready");
-        return sock;
-    }
+    static_attest(self->maxfd == len(self->sockets));
+    for (usize mut i = 0; i < self->maxfd; i++) {
+        if self->sockets[i].used == false {
+            self->sockets[i].used = true;
+            sock.ctx.fd = (int)i;
 
-    for (usize mut i = 0; i < static(len(self->sockets)); i++) {
-        if ((self->sockets)[i]).used == false {
-            ((self->sockets)[i]).used = true;
-            self->state = State::Open;
-            self->next(e, async, Event::Enter);
-            (self->statem).socket = i;
-            (sock.ctx).fd = (int)i;
+            printf("allocated sock %zu\n", i);
             return sock;
         }
     }
 
     err::fail(e, 2, "too many open sockets");
     return sock;
+}
+
+fn sockclose(io::Context mut* ctx)
+{
+    Modem mut * modem = as<Modem mut *>(ctx->handle);
+    static_attest(safe(modem));
+
+    usize idx = as<usize>(ctx->fd);
+    static_attest(idx < len(modem->sockets));
+
+    printf("api close sock %zu\n", idx);
+
+    modem->sockets[idx].close = true;
+    ctx->isvalid = false;
+
 }
 
 fn recvfrom(
@@ -89,17 +121,20 @@ fn recvfrom(
     where err::checked(*e)
     where *memlen >= len(mem)
 {
-    Modem mut * modem = as<Modem mut *>((self->ctx).handle);
+    Modem mut * modem = as<Modem mut *>(self->ctx.handle);
     static_attest(safe(modem));
-    return recvfrom_(modem, e, self, mem, memlen, addr);
+    static_attest(safe(self->ctx.async));
+
+    return recvfrom_(modem, self->ctx.async, e, self, mem, memlen, addr);
 }
 
 
 fn recvfrom_(
         Modem mut* self,
+        io::Async mut* async,
         err::Err+et mut *e,
         netudp::Socket mut* sock,
-        u8 mut* mut mem,
+        u8 mut* mem,
         usize mut*memlen,
         address::Address *addr
 ) -> io::Result
@@ -113,66 +148,21 @@ fn recvfrom_(
     usize idx = as<usize>((sock->ctx).fd);
     static_attest(idx < len(self->sockets));
 
-    if !((self->sockets)[idx]).isready {
+    if self->sockets[idx].inbuf.len == 0 {
         return io::Result::Later;
     }
 
-    string::String+50  mut str = {0};
-    str.format("AT+QIRD=%u,%u", idx + 1, *memlen);
-    static_attest(nullterm(str.mem));
-    self->cmd_cstr(e, str.mem);
-    if err::check(e) { return io::Result::Error; }
-
-    // unfortunately we have to spin here
-
-    (self->inbuf).clear();
-    for (usize mut i = 0;i<300 ;i++) {
-        if (self->io).readline(e, &self->inbuf) == io::Result::Ready {
-            if err::check(e) { return io::Result::Error; }
-            if string::starts_with_cstr(&self->inbuf, "+QIRD: ") {
-                static_attest(len((self->inbuf).mem) > 7);
-                printf("QIRD >%s<\n", (self->inbuf).mem + 7);
-                usize mut incomming_bytes = (usize)atoi((self->inbuf).mem + 7);
-
-
-                // read the addtional \r or \n at the end not consumed by readline
-                u8 mut nop[2];
-                usize mut nopl = 1;
-                (self->io).read_bytes(e, nop, &nopl);
-                if err::check(e) { return io::Result::Error; }
-
-                if incomming_bytes == 0 {
-                    ((self->sockets)[idx]).isready = false;
-                    return io::Result::Later;
-                }
-
-                if *memlen < incomming_bytes {
-                    incomming_bytes = *memlen
-                }
-
-                for (usize mut i = 0;i<1000;i++) {
-                    usize mut l = incomming_bytes;
-                    (self->io).read_bytes(e, mem, &l);
-                    if err::check(e) { return io::Result::Error; }
-                    if l >= incomming_bytes {
-                        return io::Result::Ready;
-                    }
-                    incomming_bytes -= l;
-                    mem += l;
-                }
-                break;
-            }
-            (self->inbuf).clear();
-        }
-        if err::check(e) { return io::Result::Error; }
-        usleep(1000);
+    if *memlen > self->sockets[idx].inbuf.len {
+        *memlen = self->sockets[idx].inbuf.len;
     }
 
-    if err::check(e) { return io::Result::Error; }
-    printf("no response from QIRD\n");
-    self->state = State::Reboot;
-    static_attest(safe((sock->ctx).async));
-    return next(self, e, (sock->ctx).async, Event::Enter);
+    memcpy(mem, self->sockets[idx].inbuf.mem, *memlen);
+
+    printf("received %zu bytes into userspace\n", *memlen);
+
+    self->sockets[idx].inbuf.clear();
+
+    return io::Result::Ready;
 }
 
 
@@ -189,11 +179,13 @@ fn sendto(
 {
     Modem mut * modem = as<Modem mut *>((self->ctx).handle);
     static_attest(safe(modem));
-    return sendto_(modem, e, self, mem, memlen, addr);
+    static_attest(safe(self->ctx.async));
+    return sendto_(modem, self->ctx.async, e, self, mem, memlen, addr);
 }
 
 fn sendto_(
         Modem mut* self,
+        io::Async mut* async,
         err::Err+et mut *e,
         netudp::Socket mut* sock,
         u8* mem,
@@ -225,16 +217,12 @@ fn sendto_(
     addr->ip_to_string(&str);
     str.format("\",%u", addr->get_port());
 
-
     static_attest(nullterm(str.mem));
     self->cmd_cstr(e, str.mem);
     if err::check(e) { return io::Result::Error; }
 
     self->state = State::Send;
-
-
-    //(self->io).write_bytes(e, (u8*)msg, &msglen);
-    //if err::check(e) { return io::Result::Error; }
+    async->select(e, &self->io, io::Ready::Read);
 
     return io::Result::Ready;
 }
@@ -243,9 +231,43 @@ fn sendto_(
 
 // low level interface
 
+
+
+// called whenever the modem has nothing to do
+fn idle(Modem mut* self, err::Err+et mut *e, io::Async mut* async) -> io::Result
+    where err::checked(*e)
+{
+    static_attest(len(self->sockets) > self->maxfd);
+    for (usize mut i = 0; i < self->maxfd; i++) {
+        if self->sockets[i].used {
+            // see if we need to open any sockets
+            if !self->sockets[i].isopen {
+                self->current_state_socket = i;
+                self->state = State::Open;
+                return self->next(e, async, Event::Enter);
+            }
+            // or close
+            if self->sockets[i].close {
+                self->current_state_socket = i;
+                self->state = State::Close;
+                return self->next(e, async, Event::Enter);
+            }
+            // or it has data to read
+            if self->sockets[i].isready && self->sockets[i].inbuf.len == 0 {
+                self->current_state_socket = i;
+                self->state = State::Recv;
+                return self->next(e, async, Event::Enter);
+            }
+        }
+    }
+    return io::Result::Later;
+}
+
 pub fn poll(Modem mut* self, err::Err+et mut *e, io::Async mut* async) -> io::Result
     where err::checked(*e)
 {
+    static_attest(len(self->sockets) > self->maxfd);
+
     io::Result mut rr =  io::Result::Later;
 
 
@@ -266,6 +288,28 @@ pub fn poll(Modem mut* self, err::Err+et mut *e, io::Async mut* async) -> io::Re
     }
 
 
+    if self->current_state_expectsize > 0 && self->state == State::Recv {
+        static_attest(self->current_state_socket < len(self->sockets));
+
+
+        char mut *exbuf = self->sockets[self->current_state_socket].inbuf.mem;
+        usize exlen     = self->sockets[self->current_state_socket].inbuf.len;
+        static_attest(len(exbuf) > exlen);
+        u8 mut * buf = (u8 mut*)(exbuf + exlen);
+
+        usize mut readsize = (usize)self->current_state_expectsize;
+        (self->io).read_bytes(e, buf, &readsize);
+        if err::check(e) { return io::Result::Error; }
+        self->sockets[self->current_state_socket].inbuf.len += readsize;
+        self->current_state_expectsize -= (int)readsize;
+
+        printf("expecting: %d, read: %zu\n",
+            self->current_state_expectsize,
+            readsize);
+        assert(self->current_state_expectsize>=0);
+    }
+
+
     switch (self->io).readline(e, &self->inbuf) {
         io::Result::Ready => {
             if err::check(e) { return io::Result::Error; }
@@ -279,13 +323,15 @@ pub fn poll(Modem mut* self, err::Err+et mut *e, io::Async mut* async) -> io::Re
                 } else if string::starts_with_cstr(&self->inbuf, "+QIURC: \"recv\",") {
                     static_attest((self->inbuf).len < len((self->inbuf).mem));
                     static_attest(len((self->inbuf).mem) > 15 );
-                    printf("UIRC: %s\n", (self->inbuf).mem + 15);
 
                     int fd = (int)atoi((self->inbuf).mem + 15) - 1;
-                    if fd >= 0 && fd < static(len(self->sockets)) {
-                        usize fdi = as<usize>(fd);
-                        ((self->sockets)[fdi]).isready = true;
-                        printf("socket activated: %zu\n", fdi);
+                    if fd >= 0 && (usize)fd < self->maxfd {
+                        self->sockets[(usize)fd].isready = true;
+                        printf("socket activated: %d\n", fd);
+                        if self->state == State::Ready {
+                            next(self, e, async, Event::Enter);
+                            if err::check(e) { return io::Result::Error; }
+                        }
                     }
                 }  else {
                     rr = next(self, e, async, Event::Data);
@@ -309,10 +355,10 @@ pub fn poll(Modem mut* self, err::Err+et mut *e, io::Async mut* async) -> io::Re
             return io::Result::Eof;
         }
     }
-    if err::check(e) {
-        return io::Result::Error;
-    }
 
+    if self->state == State::Ready {
+        return self->idle(e, async);
+    }
 
     if err::check(e) {
         return io::Result::Error;
@@ -322,6 +368,8 @@ pub fn poll(Modem mut* self, err::Err+et mut *e, io::Async mut* async) -> io::Re
 }
 
 enum State {
+    Reboot,
+    RebootWait,
     InitModem,
     InitUsim,
     WaitForReg,
@@ -330,18 +378,56 @@ enum State {
     GetIpAddress,
     Ready,
     Open,
+    Close,
     Send,
-    Reboot,
-    RebootWait,
+    SendDone,
+    Recv,
 }
 
 
 pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev) -> io::Result
     where err::checked(*e)
 {
-    static_attest(len((self->inbuf).mem) > 7 );
+    static_attest(len(self->inbuf.mem) > 7 );
+    static_attest(len(self->sockets) > self->maxfd);
 
     switch self->state {
+        State::Reboot => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_seconds(2));
+                    if err::check(e) {
+                        return io::Result::Error;
+                    }
+                    printf("reboot\n");
+                    cmd_cstr(self, e, "AT+CFUN=1,1");
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {
+                    self->state = State::RebootWait;
+                    return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {}
+                Event::Timeout => {
+                    self->state = State::RebootWait;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
+        State::RebootWait => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_seconds(3));
+                    if err::check(e) { return io::Result::Error; }
+                }
+                Event::Ok => {}
+                Event::Data => {}
+                Event::Timeout => {
+                    self->state = State::InitModem;
+                    return next(self, e, async, Event::Enter);
+                }
+            }
+        }
         State::InitModem => {
             switch ev {
                 Event::Enter => {
@@ -351,6 +437,10 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                     if err::check(e) { return io::Result::Error; }
 
                     printf("waiting for modem\n");
+                    //cmd_cstr(self, e, "ATE0");
+                    //if err::check(e) { return io::Result::Error; }
+                    cmd_cstr(self, e, "ATE0");
+                    if err::check(e) { return io::Result::Error; }
                     cmd_cstr(self, e, "AT");
                     if err::check(e) { return io::Result::Error; }
                 }
@@ -363,7 +453,6 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                 Event::Data => {}
                 Event::Timeout => {
                     (self->timeout).close();
-
                     return next(self, e, async, Event::Enter);
                 }
             }
@@ -379,6 +468,7 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                     if err::check(e) {
                         return io::Result::Error;
                     }
+                    self->retries = 0;
                     printf("waiting for sim\n");
                     cmd_cstr(self, e, "AT+CPIN?");
                     if err::check(e) { return io::Result::Error; }
@@ -399,9 +489,21 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                 }
                 Event::Timeout => {
                     (self->timeout).close();
-                    printf("sim timeout\n");
-                    self->state = State::Reboot;
-                    return next(self, e, async, Event::Enter);
+
+                    self->retries += 1;
+                    printf("waiting for sim %zu\n", self->retries);
+                    cmd_cstr(self, e, "AT+CPIN?");
+                    if err::check(e) { return io::Result::Error; }
+
+                    if self->retries > 10 {
+                        err::fail(e, 10, "sim timeout");
+                        return io::Result::Error;
+                    } else {
+                        self->timeout = io::timeout(async, e, time::from_seconds(1));
+                        if err::check(e) { return io::Result::Error; }
+                        async->select(e, &self->timeout, io::Ready::Read);
+                        if err::check(e) { return io::Result::Error; }
+                    }
                 }
             }
         }
@@ -440,9 +542,8 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                     if err::check(e) { return io::Result::Error; }
 
                     if self->retries > 10 {
-                        printf("reg retry timeout\n");
-                        self->state = State::Reboot;
-                        return next(self, e, async, Event::Enter);
+                        err::fail(e, 10, "reg retry timeout");
+                        return io::Result::Error;
                     } else {
                         self->timeout = io::timeout(async, e, time::from_seconds(1));
                         if err::check(e) { return io::Result::Error; }
@@ -473,10 +574,8 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                 Event::Data => {}
                 Event::Timeout => {
                     (self->timeout).close();
-
-                    printf("init apn timeout\n");
-                    self->state = State::Reboot;
-                    return next(self, e, async, Event::Enter);
+                    err::fail(e, 10, "init apn timeout");
+                    return io::Result::Error;
                 }
             }
         }
@@ -501,16 +600,14 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                 Event::Data => {
                     if string::starts_with_cstr(&self->inbuf, "ERROR") {
                         (self->timeout).close();
-                        printf("pdp error\n");
-                        self->state = State::Reboot;
-                        return next(self, e, async, Event::Enter);
+                        err::fail(e, 11, "pdp error");
+                        return io::Result::Error;
                     }
                 }
                 Event::Timeout => {
                     (self->timeout).close();
-                    printf("pdp timeout\n");
-                    self->state = State::Reboot;
-                    return next(self, e, async, Event::Enter);
+                    err::fail(e, 11, "pdp timeout");
+                    return io::Result::Error;
                 }
             }
         }
@@ -549,12 +646,6 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                     self->timeout = io::timeout(async, e, time::from_seconds(2));
                     if err::check(e) { return io::Result::Error; }
 
-                    // see if we need to open any sockets
-                    for (usize mut i = 0; i < static(len(self->sockets)); i++) {
-                        if ((self->sockets)[i]).used && !((self->sockets)[i]).isopen {
-                            (self->statem).socket = i;
-                        }
-                    }
                     return io::Result::Ready;
                 }
                 Event::Ok       => {}
@@ -571,27 +662,17 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
         State::Open => {
             switch ev {
                 Event::Enter => {
-                    printf("opening socket %zu\n", (self->statem).socket);
+                    printf("opening socket %zu\n", self->current_state_socket);
 
                     self->timeout = io::timeout(async, e, time::from_millis(200));
                     if err::check(e) { return io::Result::Error; }
                     async->select(e, &self->timeout, io::Ready::Read);
                     if err::check(e) { return io::Result::Error; }
 
-                    self->timeout = io::timeout(async, e, time::from_seconds(1));
-                    if err::check(e) { return io::Result::Error; }
-
-                    self->timeout = io::timeout(async, e, time::from_millis(100));
-                    if err::check(e) { return io::Result::Error; }
-                    async->select(e, &self->timeout, io::Ready::Read);
-                    if err::check(e) { return io::Result::Error; }
-
-                    printf("open socket\n");
-
                     //TODO random port
                     string::String+100 mut str = {0};
                     str.format("AT+QIOPEN=1,%u,\"UDP SERVICE\",\"127.0.0.1\",0,200%u,0",
-                        (self->statem).socket + 1, (self->statem).socket + 1);
+                        self->current_state_socket + 1, self->current_state_socket + 1);
 
                     static_attest(nullterm(str.mem));
                     cmd_cstr(self, e, str.mem);
@@ -604,9 +685,9 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
 
                         (self->timeout).close();
 
-                        static_attest((self->statem).socket < len(self->sockets));
-                        ((self->sockets)[(self->statem).socket]).isopen = true;
-                        (self->statem).socket = 0;
+                        static_attest(self->current_state_socket < len(self->sockets));
+                        ((self->sockets)[self->current_state_socket]).isopen = true;
+                        self->current_state_socket = 0;
 
                         self->state = State::Ready;
                         return next(self, e, async, Event::Enter);
@@ -614,17 +695,47 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                 }
                 Event::Timeout => {
                     (self->timeout).close();
+                    err::fail(e, 10, "open timeout");
+                    return io::Result::Error;
+                }
+            }
+        }
+        State::Close => {
+            switch ev {
+                Event::Enter => {
+                    printf("closing socket %zu\n", self->current_state_socket);
 
-                    printf("open timeout\n");
-                    self->state = State::Reboot;
+                    self->timeout = io::timeout(async, e, time::from_millis(100));
+                    if err::check(e) { return io::Result::Error; }
+                    async->select(e, &self->timeout, io::Ready::Read);
+                    if err::check(e) { return io::Result::Error; }
+
+                    //TODO random port
+                    string::String+100 mut str = {0};
+                    str.format("AT+QICLOSE=%u", self->current_state_socket + 1);
+                    static_attest(nullterm(str.mem));
+                    cmd_cstr(self, e, str.mem);
+                    if err::check(e) { return io::Result::Error; }
+
+
+                }
+                Event::Ok => {
+                    self->state = State::Ready;
+                    memset(&self->sockets[self->current_state_socket], 0, sizeof(Socket));
                     return next(self, e, async, Event::Enter);
+                }
+                Event::Data => {}
+                Event::Timeout => {
+                    (self->timeout).close();
+                    err::fail(e, 10, "close timeout");
+                    return io::Result::Error;
                 }
             }
         }
         State::Send => {
             switch ev {
                 Event::Enter => {
-                    self->timeout = io::timeout(async, e, time::from_millis(200));
+                    self->timeout = io::timeout(async, e, time::from_millis(100));
                 }
                 Event::Ok => {}
                 Event::Data => {
@@ -636,52 +747,82 @@ pub fn next(Modem mut* self, err::Err+et mut *e, io::Async mut* async, Event ev)
                             return io::Result::Error;
                         }
 
+                        self->state = State::SendDone;
+                        return next(self, e, async, Event::Enter);
+                    }
+                }
+                Event::Timeout => {
+                    (self->timeout).close();
+                    err::fail(e, 10, "send timeout");
+                    return io::Result::Error;
+                }
+            }
+        }
+        State::SendDone => {
+            switch ev {
+                Event::Enter => {
+                    self->timeout = io::timeout(async, e, time::from_millis(500));
+                }
+                Event::Ok => {}
+                Event::Data => {
+                    if string::starts_with_cstr(&self->inbuf, "SEND OK") {
+                        (self->timeout).close();
                         self->state = State::Ready;
                         return next(self, e, async, Event::Enter);
                     }
                 }
                 Event::Timeout => {
                     (self->timeout).close();
-
-                    printf("send timeout\n");
-                    self->state = State::Reboot;
-                    return next(self, e, async, Event::Enter);
+                    err::fail(e, 10, "send timeout");
+                    return io::Result::Error;
                 }
             }
         }
-        State::Reboot => {
+        State::Recv => {
             switch ev {
                 Event::Enter => {
-                    self->timeout = io::timeout(async, e, time::from_seconds(2));
-                    if err::check(e) {
-                        return io::Result::Error;
-                    }
-                    printf("reboot\n");
-                    cmd_cstr(self, e, "AT+CFUN=1,1");
+                    self->timeout = io::timeout(async, e, time::from_millis(400));
                     if err::check(e) { return io::Result::Error; }
+
+                    string::String+50  mut str = {0};
+                    str.format("AT+QIRD=%u,%u", self->current_state_socket + 1, static(len(self->sockets[0].inbuf.mem)));
+                    static_attest(nullterm(str.mem));
+                    self->cmd_cstr(e, str.mem);
+                    if err::check(e) { return io::Result::Error; }
+
+                    self->current_state_expectsize = -1;
                 }
                 Event::Ok => {
-                    self->state = State::RebootWait;
+
+                    if self->current_state_expectsize != 0 {
+                        err::fail(e, 11, "short read");
+                        return io::Result::Error;
+                    }
+
+                    self->state = State::Ready;
                     return next(self, e, async, Event::Enter);
                 }
-                Event::Data => {}
+                Event::Data => {
+                    if string::starts_with_cstr(&self->inbuf, "+QIRD: ") {
+                        static_attest(len((self->inbuf).mem) > 7);
+                        self->current_state_expectsize = (int)atoi((self->inbuf).mem + 7);
+
+                        // read the addtional \r or \n at the end not consumed by readline
+                        u8 mut nop[2];
+                        usize mut nopl = 1;
+                        (self->io).read_bytes(e, nop, &nopl);
+                        if err::check(e) { return io::Result::Error; }
+
+                        if self->current_state_expectsize == 0 {
+                            static_attest(self->current_state_socket < len(self->sockets));
+                            self->sockets[self->current_state_socket].isready = false;
+                        }
+                    }
+                }
                 Event::Timeout => {
-                    self->state = State::RebootWait;
-                    return next(self, e, async, Event::Enter);
-                }
-            }
-        }
-        State::RebootWait => {
-            switch ev {
-                Event::Enter => {
-                    self->timeout = io::timeout(async, e, time::from_seconds(3));
-                    if err::check(e) { return io::Result::Error; }
-                }
-                Event::Ok => {}
-                Event::Data => {}
-                Event::Timeout => {
-                    self->state = State::InitModem;
-                    return next(self, e, async, Event::Enter);
+                    (self->timeout).close();
+                    err::fail(e, 10, "receive timeout");
+                    return io::Result::Error;
                 }
             }
         }
@@ -709,7 +850,13 @@ pub fn cmd_cstr(Modem mut* self, err::Err+et mut*e, char *cstr)
     where nullterm(cstr)
     where err::checked(*e)
 {
-    usize mut cstrlen = string::strlen(cstr);
+    usize mut cstrlen = 1;
+    (self->io).write_bytes(e, (u8*)"\r", &cstrlen);
+    if err::check(e) {
+        return;
+    }
+
+    cstrlen = string::strlen(cstr);
     (self->io).write_bytes(e, (u8*)cstr, &cstrlen);
     if err::check(e) {
         return;
@@ -725,7 +872,7 @@ pub fn cmd_cstr(Modem mut* self, err::Err+et mut*e, char *cstr)
 
 
 
-pub fn start(Modem mut* self, err::Err+et mut *e, io::Async mut* async)
+pub fn start(Modem+maxfd mut* self, err::Err+et mut *e, io::Async mut* async)
     where err::checked(*e)
 {
     next(self, e, async, Event::Enter);
